@@ -7,11 +7,71 @@ import pandas as pd
 from bson import json_util
 from bson.objectid import ObjectId
 from nltk.corpus import stopwords
-from sklearn.metrics import normalized_mutual_info_score
+from sklearn.metrics import normalized_mutual_info_score, adjusted_mutual_info_score
+from skmultilearn.problem_transform import BinaryRelevance
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+import sklearn.metrics as metrics
+from sklearn.metrics import log_loss
+from scipy.special import kl_div
+import copy
 
 app = Flask(__name__)
 CORS(app)
 mongo = PyMongo(app, uri="mongodb://localhost:27017")
+
+br_kernel_dict = {"knn": KNeighborsClassifier(), "svc": SVC()}
+
+def hamming_score(y_true, y_pred, normalize=True, sample_weight=None):
+    '''
+    Compute the Hamming score (a.k.a. label-based accuracy) for the multi-label case
+    https://stackoverflow.com/q/32239577/395857
+    '''
+    acc_list = []
+    for i in range(y_true.shape[0]):
+        set_true = set( np.where(y_true[i])[0] )
+        set_pred = set( np.where(y_pred[i])[0] )
+        #print('\nset_true: {0}'.format(set_true))
+        #print('set_pred: {0}'.format(set_pred))
+        tmp_a = None
+        if len(set_true) == 0 and len(set_pred) == 0:
+            tmp_a = 1
+        else:
+            tmp_a = len(set_true.intersection(set_pred))/\
+                    float( len(set_true.union(set_pred)) )
+        #print('tmp_a: {0}'.format(tmp_a))
+        acc_list.append(tmp_a)
+    return np.mean(acc_list)
+
+def get_mutual_information(dfname, dftype, space, group_id):
+    db = mongo.cx[f"{dfname}_{dftype}"]
+    filter_result = db["graph_filters"].find_one({"_id": ObjectId(group_id) })
+
+    #print(group_id)
+
+    if filter_result["group_type"] == "selected":
+        points = filter_result["points"]
+    elif filter_result["group_type"] == "query":
+        query_docs = db["labels"].find(filter_result["query"])
+        points = [ query_doc["_id"] for query_doc in query_docs ]
+
+    all_labels_doc =  db[space].find({})
+    all_labels = [ doc for doc in all_labels_doc ]
+
+    #print(all_labels)
+
+    all_labels_index = [ x["_id"] for x in all_labels ]
+    y_df = pd.DataFrame(all_labels,index=all_labels_index)
+
+    group = y_df["_id"].apply(lambda x: 1 if x in set(points) else 0).to_numpy()
+
+    mutual_information_dict = {}
+    for tag in y_df.drop(columns="_id").columns:
+        mutual_information_dict[tag] = normalized_mutual_info_score(y_df[tag].to_numpy(),group)
+
+    result = sorted(mutual_information_dict.items(), key=lambda x:x[1], reverse=True)[:10]
+
+    return result
 
 @app.route("/hello/<string:dfname>/<string:dftype>")
 def hello(dfname, dftype):
@@ -140,6 +200,49 @@ def heatmap(dfname,dftype):
     return ujson.dumps({"dataset": dfname, "dataset_type": dftype, "echart_x": echart_x,
     "echart_y": echart_y, "echart_data": echart_data.values.tolist(), "filter_id": filter_id})
 
+@app.route("/heatmap2/<string:dfname>/<string:dftype>")
+def heatmap2(dfname, dftype):
+    group_id = request.args.get("filter_id")
+
+    db = mongo.cx[f"{dfname}_{dftype}"]
+    
+    # 先求对最这个 group mutual information 最大的 future 和 label
+    feature_mi = get_mutual_information(dfname, dftype, "features", group_id)
+    label_mi = get_mutual_information(dfname, dftype, "labels", group_id)
+
+    doc_group = db["graph_filters"].find_one({"_id": {"$eq": ObjectId(group_id)}})
+
+    if doc_group["group_type"] == "selected" or doc_group["group_type"] == "selected_combination":
+        doc_query = {"_id": {"$in": doc_group["points"]}}
+    elif doc_group["group_type"] == "query":
+        query_docs = db["labels"].find(doc_group["query"])
+        doc_query = {"_id" : {"$in": [query_doc["_id"] for query_doc in query_docs]} }
+
+    # 准备好 X_train 和 y_train
+    feature_selector ={"_id": 0}
+    for item in feature_mi:
+        feature_selector[item[0]] = 1 
+
+    X_train_doc = db["features"].find(doc_query, feature_selector)
+    X_df = pd.DataFrame([doc for doc in X_train_doc])
+
+    label_selector ={"_id": 0}
+    for item in label_mi:
+        label_selector[item[0]] = 1 
+
+    y_train_doc =  db["labels"].find(doc_query, label_selector)
+    y_df = pd.DataFrame([doc for doc in y_train_doc])
+
+    echart_data = []
+    for feat in X_df.columns:
+        for labl in y_df.columns:
+            echart_data.append([feat, labl, normalized_mutual_info_score(X_df[feat].to_numpy(), y_df[labl].to_numpy())])
+
+    echart_x=list(X_df.columns)
+    echart_y=list(y_df.columns)
+
+    return ujson.dumps({"dataset": dfname, "dataset_type": dftype, "echart_x": echart_x,
+    "echart_y": echart_y, "echart_data": echart_data, "filter_id": group_id})
 
 @app.route("/example/<string:dfname>/<string:dftype>/<string:exid>", methods=["GET","POST"])
 def example_details(dfname, dftype, exid):
@@ -243,6 +346,14 @@ def get_label_names(dfname):
     label_names.remove("_id")
     return {"labels": label_names}
 
+@app.route("/available/features/<string:dfname>")
+def get_feature_names(dfname):
+    db = mongo.cx[f"{dfname}_train"]
+    doc = db["features"].find_one({})
+    feature_names = list(doc.keys())
+    feature_names.remove("_id")
+    return {"features": feature_names}
+
 @app.route("/feature/count_100", methods=["POST"])
 def get_feature_count_100():
     request_body = ujson.loads(request.data)
@@ -267,6 +378,80 @@ def get_feature_count_100():
     
     return {"group_id": group_id, "result": res}
     
+@app.route("/group/mutual_information")
+def group_mutual_information():
+    dfname = request.args.get("dataset_name")
+    dftype = request.args.get("dataset_type")
+    group_id = request.args.get("group_id")
+    space = request.args.get("space")
+
+    result = get_mutual_information(dfname, dftype, space, group_id) 
+
+    return {"group_id": group_id, "result": result}
+
+@app.route("/group/label")
+def group_label():
+    dfname = request.args.get("dataset_name")
+    dftype = request.args.get("dataset_type")
+    group_id = request.args.get("group_id")
+
+    db = mongo.cx[f"{dfname}_{dftype}"]
+
+    print(dfname,dftype)
+
+    return 0
+
+@app.route("/train/classifier",methods=["POST"])
+def train_classifier():
+    # 从 post 的请求 body 中获取参数
+    request_body = ujson.loads(request.data)
+    dfname = request_body["dataset_name"]
+    select_feature = request_body["select_feature"]
+    select_label = request_body["select_label"]
+    classifer = request_body["classifier"]
+    br_kernel = request_body["br_kernel"]
+
+    db_train = mongo.cx[f"{dfname}_train"]
+    db_test = mongo.cx[f"{dfname}_test"]
+
+    # build X_train and X_test
+    feature_selector = {"_id": 0}
+    for feature in select_feature:
+        feature_selector[feature] = 1
+
+    X_train_doc =  db_train["features"].find({}, feature_selector)
+    X_train_df = pd.DataFrame([doc for doc in X_train_doc])
+
+    X_test_doc =  db_test["features"].find({}, feature_selector)
+    X_test_df = pd.DataFrame([doc for doc in X_test_doc])
+
+    # build y_train and y_test
+    label_selector = {"_id": 0}
+    for label in select_label:
+        label_selector[label] = 1
+
+    y_train_doc =  db_train["labels"].find({}, label_selector)
+    y_train_df = pd.DataFrame([doc for doc in y_train_doc])
+
+    y_test_doc =  db_test["labels"].find({}, label_selector)
+    y_test_df = pd.DataFrame([doc for doc in y_test_doc])
+
+    # 训练 Classifier
+    if classifer == "BinaryRelevance":
+        clf = BinaryRelevance(classifier=copy.deepcopy(br_kernel_dict[br_kernel]),require_dense=[False, True])
+        clf.fit(X_train_df, y_train_df)
+
+    prediction = clf.predict(X_test_df)
+    prediction = prediction.todense()
+    y_test_df = y_test_df.to_numpy()
+
+    hamming_loss = metrics.hamming_loss(y_test_df, prediction)
+    accuracy_score = metrics.accuracy_score(y_test_df, prediction)
+    hamming_score_ = hamming_score(y_test_df, prediction)
+
+    return {"dataset_name": dfname,"select_feature": select_feature,
+    "select_label": select_label, "hamming_loss": hamming_loss,
+    "accuracy_score": accuracy_score, "hamming_score": hamming_score_, "br_kernel": br_kernel}
 
 if __name__ == "__main__":
     app.run(debug=True, host="127.0.0.1", port=5001)
