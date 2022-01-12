@@ -1,5 +1,6 @@
 import copy
 import pandas as pd
+from .helpers import hamming_score
 
 class partialBR:
 
