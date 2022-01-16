@@ -334,6 +334,16 @@ def get_feature_names(dfname):
     feature_names.remove("_id")
     return {"features": feature_names}
 
+@app.route("/feature/get_point/<string:dfname>/<string:dftype>")
+def get_point(dfname,dftype):
+    point_id = request.args.get("point_id")
+
+    db = mongo.cx[f"{dfname}_{dftype}"]
+    doc = db["labels"].find_one({"_id": {"$eq": point_id}})
+    result = [ k for k,v in doc.items() if v == 1 ]
+
+    return ujson.dumps(result)
+
 @app.route("/feature/count_100", methods=["POST"])
 def get_feature_count_100():
     request_body = ujson.loads(request.data)
