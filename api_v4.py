@@ -443,5 +443,35 @@ def train_classifier():
     "select_label": select_label, "hamming_loss": hamming_loss,
     "accuracy_score": accuracy_score, "hamming_score": hamming_score_, "br_kernel": br_kernel}
 
+@app.route("/feature/query_label",methods=["POST"])
+def query_label():
+    request_body = ujson.loads(request.data)
+    dfname = request_body["dataset_name"]
+    dftype = request_body["dataset_type"]
+    select_label = request_body["select_label"]
+
+    print(request_body)
+
+    db = mongo.cx[f"{dfname}_{dftype}"]
+
+    # get y that match query
+
+    label_selector = {"$or": []}
+    for label in select_label:
+        label_selector["$or"].append({label: 1})
+
+    y_doc =  db["labels"].find(label_selector)
+    y_df = pd.DataFrame([doc for doc in y_doc])
+    y_df = y_df.set_index("_id")
+    
+    X_doc = db["features"].find({"_id": {"$in": list(y_df.index)}})
+    X_df = pd.DataFrame([doc for doc in X_doc])
+    X_df = X_df.set_index("_id")
+
+    feature_list = X_df.apply(lambda x: x.index[x != 0.0].to_list(), axis=1).to_dict()
+    label_list = y_df.apply(lambda x: x.index[x != 0.0].to_list(), axis=1).to_dict()
+
+    return {"select_label": select_label,"feature_list": feature_list, "label_list": label_list}
+
 if __name__ == "__main__":
     app.run(debug=True, host="127.0.0.1", port=5001)
